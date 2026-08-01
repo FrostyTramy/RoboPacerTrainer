@@ -244,6 +244,25 @@
     background: var(--accent); color: #0d1117;
     border: none; border-radius: 6px; font-weight: 600; cursor: pointer;
   }
+
+  /* ── Convert button ── */
+  #btn-convert {
+    width: 100%; padding: 11px; font-size: .92rem; font-weight: 600;
+    background: var(--green); color: #0d1117; border: none; border-radius: 8px;
+    cursor: pointer; letter-spacing: .3px; margin-top: 2px;
+    transition: opacity .2s, transform .1s;
+  }
+  #btn-convert:hover:not(:disabled) { opacity: .88; }
+  #btn-convert:active:not(:disabled) { transform: scale(.98); }
+  #btn-convert:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ── Select ── */
+  select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); padding: 7px 10px; font-size: .85rem;
+    outline: none; transition: border-color .2s; appearance: none;
+  }
+  select:focus { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -350,6 +369,44 @@
     <!-- Action -->
     <button id="btn-train" onclick="startTraining()">Train &amp; Export</button>
 
+    <!-- Convert PTH → HEF -->
+    <div class="card">
+      <div class="card-title">Convert PTH → HEF</div>
+      <div class="field">
+        <label>Model (.pth in models\)</label>
+        <select id="convert-name">
+          <option value="">— select model —</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Export to</label>
+        <div class="fmt-grid">
+          <label class="fmt-item">
+            <input type="checkbox" value="onnx" id="cv-fmt-onnx" checked>
+            <div class="cb"></div>
+            ONNX <span class="fmt-badge">.onnx</span>
+          </label>
+          <label class="fmt-item">
+            <input type="checkbox" value="har" id="cv-fmt-har">
+            <div class="cb"></div>
+            HAR <span class="fmt-badge">.har</span>
+          </label>
+          <label class="fmt-item" style="grid-column:span 2">
+            <input type="checkbox" value="hef" id="cv-fmt-hef" checked>
+            <div class="cb"></div>
+            HEF <span class="fmt-badge">.hef</span>
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Driving log JSON
+          <span style="color:var(--muted);font-size:.7rem">(only if calib_data.npy missing)</span>
+        </label>
+        <input type="text" id="convert-json" placeholder="D:\RoboPacer\driving_log.json">
+      </div>
+      <button id="btn-convert" onclick="startConvert()">Convert</button>
+    </div>
+
   </div>
 
   <!-- RIGHT PANEL -->
@@ -410,10 +467,10 @@
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
-const API  = 'http://localhost:5000';
+const API    = 'http://localhost:5000';
 let lossData = { train: [], val: [] };
 let jobFiles = [];
-let sse = null;
+let sse      = null;
 
 // ── Server status polling ─────────────────────────────────────────────────────
 async function checkStatus() {
@@ -423,6 +480,7 @@ async function checkStatus() {
     setDot(d.running ? 'yellow' : 'green', d.running ? 'Running…' : 'Ready');
     document.getElementById('no-server').classList.remove('show');
     renderFiles(d.models, false);
+    populateConvertSelect(d.models);
   } catch {
     setDot('red', 'Server offline');
     document.getElementById('no-server').classList.add('show');
@@ -430,24 +488,53 @@ async function checkStatus() {
 }
 
 function setDot(cls, text) {
-  const dot  = document.getElementById('status-dot');
-  const span = document.getElementById('status-text');
-  dot.className  = `dot ${cls}`;
-  span.textContent = text;
+  document.getElementById('status-dot').className = `dot ${cls}`;
+  document.getElementById('status-text').textContent = text;
 }
 
-// Poll every 5 s when idle
 setInterval(checkStatus, 5000);
 checkStatus();
 
-// ── Pre-fill defaults from URL or window location ─────────────────────────────
+// ── Pre-fill defaults ─────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
-  // Try to detect root from server
-  const base = window.location.origin.includes('localhost') ? '' : null;
-  // Suggest defaults in placeholders
-  document.getElementById('frames-dir').value = 'D:\\RoboPacer\\frames';
+  document.getElementById('frames-dir').value  = 'D:\\RoboPacer\\frames';
   document.getElementById('json-path').value   = 'D:\\RoboPacer\\driving_log.json';
+  document.getElementById('convert-json').value = 'D:\\RoboPacer\\driving_log.json';
 });
+
+// ── Job state helpers ─────────────────────────────────────────────────────────
+// state: 'idle' | 'training' | 'stopping' | 'converting'
+function setJobState(state) {
+  const btnTrain   = document.getElementById('btn-train');
+  const btnConvert = document.getElementById('btn-convert');
+
+  if (state === 'training') {
+    btnTrain.disabled    = false;
+    btnTrain.textContent = 'Stop & Export';
+    btnTrain.className   = 'running';
+    btnTrain.onclick     = stopTraining;
+    btnConvert.disabled  = true;
+  } else if (state === 'stopping') {
+    btnTrain.disabled    = true;
+    btnTrain.textContent = 'Stopping…';
+    btnTrain.className   = 'running';
+    btnConvert.disabled  = true;
+  } else if (state === 'converting') {
+    btnTrain.disabled     = true;
+    btnTrain.textContent  = 'Train & Export';
+    btnTrain.className    = '';
+    btnTrain.onclick      = startTraining;
+    btnConvert.disabled   = true;
+    btnConvert.textContent = 'Converting…';
+  } else { // idle
+    btnTrain.disabled     = false;
+    btnTrain.textContent  = 'Train & Export';
+    btnTrain.className    = '';
+    btnTrain.onclick      = startTraining;
+    btnConvert.disabled   = false;
+    btnConvert.textContent = 'Convert';
+  }
+}
 
 // ── Train ─────────────────────────────────────────────────────────────────────
 async function startTraining() {
@@ -465,14 +552,13 @@ async function startTraining() {
     .filter(f => document.getElementById(`fmt-${f}`).checked);
   if (!formats.length) return alert('Select at least one export format.');
 
-  // Reset UI
   lossData = { train: [], val: [] };
   jobFiles = [];
   resetChart();
   clearConsole();
   setProgress(0, '—', '—', '—');
   renderFiles([], true);
-  setBtn(true);
+  setJobState('training');
 
   const config = { model_name: name, frames_dir: frames, json_path: json,
                    epochs, batch_size: batch, formats };
@@ -485,16 +571,70 @@ async function startTraining() {
     if (!r.ok) {
       const e = await r.json();
       addLog(`Error: ${e.error}`, 'error');
-      setBtn(false);
+      setJobState('idle');
       return;
     }
     streamProgress();
   } catch (e) {
     addLog(`Cannot reach server: ${e}`, 'error');
-    setBtn(false);
+    setJobState('idle');
   }
 }
 
+// ── Stop ──────────────────────────────────────────────────────────────────────
+async function stopTraining() {
+  setJobState('stopping');
+  try {
+    await fetch(`${API}/api/stop`, { method: 'POST' });
+    addLog('Stop requested — finishing current epoch then exporting…', 'warning');
+  } catch (e) {
+    addLog(`Stop failed: ${e}`, 'error');
+    setJobState('training');
+  }
+}
+
+// ── Convert PTH → HEF ────────────────────────────────────────────────────────
+async function startConvert() {
+  const name = document.getElementById('convert-name').value.trim();
+  const json = document.getElementById('convert-json').value.trim();
+
+  if (!name) return alert('Select a model to convert.');
+
+  const formats = ['onnx','har','hef']
+    .filter(f => document.getElementById(`cv-fmt-${f}`).checked);
+  if (!formats.length) return alert('Select at least one export format.');
+
+  lossData = { train: [], val: [] };
+  jobFiles = [];
+  resetChart();
+  clearConsole();
+  setProgress(0, '—', '—', '—');
+  renderFiles([], true);
+  setJobState('converting');
+
+  const config = { model_name: name, formats };
+  if (json) config.json_path = json;
+
+  try {
+    const r = await fetch(`${API}/api/convert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    if (!r.ok) {
+      const e = await r.json();
+      addLog(`Error: ${e.error}`, 'error');
+      setJobState('idle');
+      return;
+    }
+    streamProgress();
+  } catch (e) {
+    addLog(`Cannot reach server: ${e}`, 'error');
+    setJobState('idle');
+  }
+}
+
+// ── SSE stream ────────────────────────────────────────────────────────────────
 function streamProgress() {
   if (sse) sse.close();
   sse = new EventSource(`${API}/api/stream`);
@@ -503,14 +643,14 @@ function streamProgress() {
     handleEvent(ev);
     if (ev.type === 'done') {
       sse.close();
-      setBtn(false);
+      setJobState('idle');
       setDot('green', 'Ready');
       addLog('Job complete.', 'success');
     }
   };
   sse.onerror = () => {
     sse.close();
-    setBtn(false);
+    setJobState('idle');
   };
 }
 
@@ -587,6 +727,14 @@ function renderFiles(files, highlight) {
   }).join('');
 }
 
+function populateConvertSelect(models) {
+  const sel = document.getElementById('convert-name');
+  const cur = sel.value;
+  const pths = (models || []).filter(m => m.endsWith('.pth')).map(m => m.replace('.pth', ''));
+  sel.innerHTML = '<option value="">— select model —</option>' +
+    pths.map(n => `<option value="${n}"${n === cur ? ' selected' : ''}>${n}.pth</option>`).join('');
+}
+
 // ── Chart ─────────────────────────────────────────────────────────────────────
 function resetChart() {
   document.getElementById('chart-train').setAttribute('points', '');
@@ -598,7 +746,6 @@ function updateChart(totalEpochs) {
   const all = [...lossData.train, ...lossData.val];
   if (!all.length) return;
   const maxV = Math.max(...all) || 1;
-  const n    = lossData.train.length;
 
   function toPoints(arr) {
     return arr.map((v, i) => {
@@ -609,14 +756,6 @@ function updateChart(totalEpochs) {
   }
   document.getElementById('chart-train').setAttribute('points', toPoints(lossData.train));
   document.getElementById('chart-val').setAttribute('points', toPoints(lossData.val));
-}
-
-// ── Button state ──────────────────────────────────────────────────────────────
-function setBtn(running) {
-  const btn = document.getElementById('btn-train');
-  btn.disabled = running;
-  btn.textContent = running ? 'Training…' : 'Train & Export';
-  btn.className = running ? 'running' : '';
 }
 </script>
 </body>

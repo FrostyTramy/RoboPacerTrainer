@@ -16,9 +16,10 @@ sys.path.insert(0, str(ENGINE_DIR))
 app = Flask(__name__)
 
 # ── Job state ─────────────────────────────────────────────────────────────────
-_lock    = threading.Lock()
-_running = False
-_events  = []   # list of SSE event dicts, appended during a job
+_lock       = threading.Lock()
+_running    = False
+_events     = []   # list of SSE event dicts, appended during a job
+_stop_event = threading.Event()
 
 
 def _push(event: dict):
@@ -50,12 +51,13 @@ def api_train():
         config   = request.json or {}
         _running = True
         _events  = []
+        _stop_event.clear()
 
     def run():
         global _running
         try:
             import train
-            train.run(config, _push)
+            train.run(config, _push, should_stop=_stop_event.is_set)
         except Exception as e:
             _push({"type": "log", "text": traceback.format_exc(), "level": "error"})
         finally:
@@ -63,6 +65,39 @@ def api_train():
             _running = False
 
     threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    if not _running:
+        return jsonify({"error": "No job running."}), 409
+    _stop_event.set()
+    return jsonify({"status": "stopping"})
+
+
+@app.route("/api/convert", methods=["POST"])
+def api_convert():
+    global _running, _events
+    with _lock:
+        if _running:
+            return jsonify({"error": "A job is already running."}), 409
+        config   = request.json or {}
+        _running = True
+        _events  = []
+
+    def run_convert():
+        global _running
+        try:
+            import train
+            train.convert(config, _push)
+        except Exception as e:
+            _push({"type": "log", "text": traceback.format_exc(), "level": "error"})
+        finally:
+            _push({"type": "done"})
+            _running = False
+
+    threading.Thread(target=run_convert, daemon=True).start()
     return jsonify({"status": "started"})
 
 

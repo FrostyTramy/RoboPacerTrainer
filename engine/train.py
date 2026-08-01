@@ -65,16 +65,25 @@ def build_model():
 
 # ── Train / eval loops ────────────────────────────────────────────────────────
 
-def _train_epoch(model, loader, optimizer, device):
+def _train_epoch(model, loader, optimizer, device, push=None):
     model.train()
-    total = 0.0
-    for imgs, angles in loader:
+    total    = 0.0
+    samples  = 0
+    n        = len(loader)
+    log_step = max(1, n // 10)
+    for i, (imgs, angles) in enumerate(loader):
         imgs, angles = imgs.to(device), angles.to(device)
         optimizer.zero_grad()
         loss = nn.functional.mse_loss(model(imgs).squeeze(1), angles)
         loss.backward()
         optimizer.step()
-        total += loss.item() * len(imgs)
+        batch_n  = len(imgs)
+        total   += loss.item() * batch_n
+        samples += batch_n
+        if push and (i + 1) % log_step == 0:
+            push({"type": "log",
+                  "text": f"  train batch {i+1}/{n}  loss={total/samples:.5f}",
+                  "level": "info"})
     return total / len(loader.dataset)
 
 
@@ -117,8 +126,7 @@ def _save_calib(records, data_root, out_path):
 # ── Docker HEF compilation ────────────────────────────────────────────────────
 
 def _compile_hef(model_name: str, push):
-    models_dir  = ROOT_DIR / "models"
-    compile_sh  = ENGINE_DIR / "compile" / "compile.sh"
+    compile_sh = ENGINE_DIR / "compile" / "compile.sh"
 
     push({"type": "log", "text": "Checking Docker...", "level": "info"})
     r = subprocess.run(["docker", "info"], capture_output=True)
@@ -127,14 +135,19 @@ def _compile_hef(model_name: str, push):
         return False
 
     push({"type": "log", "text": "Building hailo-dfc image (uses cache if already built)...", "level": "info"})
-    r = subprocess.run(
-        ["docker", "build", "-t", "hailo-dfc",
+    build_proc = subprocess.Popen(
+        ["docker", "build", "--progress=plain", "-t", "hailo-dfc",
          "-f", str(ENGINE_DIR / "compile" / "Dockerfile"),
          str(ENGINE_DIR)],
-        capture_output=True, text=True
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace'
     )
-    if r.returncode != 0:
-        push({"type": "log", "text": f"Docker build failed:\n{r.stderr}", "level": "error"})
+    for line in build_proc.stdout:
+        line = line.rstrip()
+        if line:
+            push({"type": "log", "text": line, "level": "docker"})
+    build_proc.wait()
+    if build_proc.returncode != 0:
+        push({"type": "log", "text": "Docker build failed.", "level": "error"})
         return False
 
     push({"type": "log", "text": f"Compiling {model_name} to HEF inside Docker...", "level": "info"})
@@ -159,9 +172,57 @@ def _compile_hef(model_name: str, push):
     return True
 
 
+# ── Shared export pipeline ────────────────────────────────────────────────────
+
+def _do_exports(model, model_name, formats, push, models_dir, device,
+                records=None, data_root=None):
+    """Export a loaded model to the requested formats."""
+    need_onnx  = "onnx" in formats
+    need_hailo = "hef" in formats or "har" in formats
+    onnx_path  = models_dir / f"{model_name}.onnx"
+
+    if need_onnx or need_hailo:
+        push({"type": "log", "text": "Exporting ONNX...", "level": "info"})
+        _export_onnx(model, device, onnx_path)
+        push({"type": "log", "text": f"Saved: models/{model_name}.onnx", "level": "success"})
+    if need_onnx:
+        push({"type": "file", "name": f"{model_name}.onnx"})
+
+    if need_hailo:
+        calib_path = models_dir / "calib_data.npy"
+        if not calib_path.exists():
+            if records and data_root:
+                push({"type": "log", "text": "Saving calibration data...", "level": "info"})
+                _save_calib(records, data_root, calib_path)
+            else:
+                push({"type": "log",
+                      "text": "calib_data.npy not found — provide a driving log JSON to generate it.",
+                      "level": "error"})
+                return
+
+        ok = _compile_hef(model_name, push)
+        if ok:
+            if "hef" in formats:
+                push({"type": "file", "name": f"{model_name}.hef"})
+            if "har" in formats:
+                compiled = models_dir / f"{model_name}_compiled.har"
+                if compiled.exists():
+                    push({"type": "file", "name": f"{model_name}_compiled.har"})
+
+        if not need_onnx and onnx_path.exists():
+            onnx_path.unlink()
+        if "har" not in formats:
+            for tmp in [models_dir / f"{model_name}.har",
+                        models_dir / f"{model_name}_optimized.har"]:
+                if tmp.exists():
+                    tmp.unlink()
+
+    push({"type": "log", "text": "All exports complete.", "level": "success"})
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def run(config: dict, push=None):
+def run(config: dict, push=None, should_stop=None):
     """
     config keys:
       frames_dir  : absolute path to frames folder
@@ -171,6 +232,7 @@ def run(config: dict, push=None):
       batch_size  : int  (default 32)
       formats     : list of "pth" | "onnx" | "har" | "hef"
     push(event_dict) streams progress to the web UI.
+    should_stop() returns True when early stop has been requested.
     """
     if push is None:
         push = lambda e: print(e.get("text", e))
@@ -192,16 +254,13 @@ def run(config: dict, push=None):
     push({"type": "log", "text": f"Model name: {model_name}", "level": "info"})
     push({"type": "log", "text": f"Formats: {sorted(formats)}", "level": "info"})
 
-    # Load records
     with open(json_path) as f:
         records = json.load(f)
 
-    # Resolve image paths relative to json location
     data_root = json_path.parent
     records = [r for r in records if (data_root / r["image_path"]).exists()]
     push({"type": "log", "text": f"Valid samples: {len(records)}", "level": "info"})
 
-    # Split 80/10/10
     random.shuffle(records)
     n       = len(records)
     n_train = int(0.80 * n)
@@ -225,7 +284,9 @@ def run(config: dict, push=None):
     push({"type": "log", "text": f"Training for {epochs} epochs...", "level": "info"})
 
     for epoch in range(1, epochs + 1):
-        train_loss = _train_epoch(model, train_ld, optimizer, device)
+        push({"type": "log", "text": f"Epoch {epoch}/{epochs} — training...", "level": "info"})
+        train_loss = _train_epoch(model, train_ld, optimizer, device, push)
+        push({"type": "log", "text": f"Epoch {epoch}/{epochs} — validating...", "level": "info"})
         val_loss   = _eval_epoch(model, val_ld, device)
         scheduler.step()
         is_best = val_loss < best_val
@@ -239,59 +300,71 @@ def run(config: dict, push=None):
             "val":   round(val_loss, 6),
             "best":  is_best,
         })
+        if should_stop and should_stop():
+            push({"type": "log",
+                  "text": f"Stopped at epoch {epoch} — exporting best checkpoint...",
+                  "level": "warning"})
+            break
 
     push({"type": "log", "text": f"Best val MSE: {best_val:.6f}  RMSE: {best_val**0.5:.4f}", "level": "success"})
 
-    # Load best weights
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
 
-    # Always save .pth checkpoint
     push({"type": "log", "text": f"Saved: models/{model_name}.pth", "level": "success"})
     push({"type": "file", "name": f"{model_name}.pth"})
 
-    # Export ONNX (needed for HEF/HAR too)
-    need_onnx  = "onnx" in formats
-    need_hailo = "hef" in formats or "har" in formats
-    onnx_path  = models_dir / f"{model_name}.onnx"
+    _do_exports(model, model_name, formats, push, models_dir, device, records, data_root)
 
-    if need_onnx or need_hailo:
-        push({"type": "log", "text": "Exporting ONNX...", "level": "info"})
-        _export_onnx(model, device, onnx_path)
-        push({"type": "log", "text": f"Saved: models/{model_name}.onnx", "level": "success"})
 
-    if need_onnx:
-        push({"type": "file", "name": f"{model_name}.onnx"})
+# ── Convert existing PTH to other formats ────────────────────────────────────
 
-    # Save calibration data (needed for HEF/HAR)
-    if need_hailo:
-        calib_path = models_dir / "calib_data.npy"
-        push({"type": "log", "text": "Saving calibration data...", "level": "info"})
-        _save_calib(records, data_root, calib_path)
+def convert(config: dict, push=None):
+    """
+    Convert an existing .pth checkpoint to ONNX / HAR / HEF.
+    config keys:
+      model_name : name of the model (loads models/{model_name}.pth)
+      formats    : list of "onnx" | "har" | "hef"
+      json_path  : (optional) driving_log.json path — only needed if
+                   models/calib_data.npy does not already exist
+    """
+    if push is None:
+        push = lambda e: print(e.get("text", e))
 
-        ok = _compile_hef(model_name, push)
+    model_name = config.get("model_name", "model").strip() or "model"
+    formats    = set(config.get("formats", ["onnx"]))
+    json_path  = config.get("json_path", "").strip()
+    models_dir = ROOT_DIR / "models"
+    models_dir.mkdir(exist_ok=True)
 
-        if ok:
-            if "hef" in formats:
-                push({"type": "file", "name": f"{model_name}.hef"})
-            if "har" in formats:
-                # Keep the compiled HAR
-                compiled = models_dir / f"{model_name}_compiled.har"
-                if compiled.exists():
-                    push({"type": "file", "name": f"{model_name}_compiled.har"})
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    push({"type": "log", "text": f"Device: {device}", "level": "info"})
 
-        # Clean up ONNX if not requested
-        if not need_onnx and onnx_path.exists():
-            onnx_path.unlink()
+    ckpt_path = models_dir / f"{model_name}.pth"
+    if not ckpt_path.exists():
+        push({"type": "log", "text": f"Not found: models/{model_name}.pth", "level": "error"})
+        return
 
-        # Clean up intermediate HAR files if HAR not requested
-        if "har" not in formats:
-            for tmp in [models_dir / f"{model_name}.har",
-                        models_dir / f"{model_name}_optimized.har"]:
-                if tmp.exists():
-                    tmp.unlink()
+    push({"type": "log", "text": f"Loading {model_name}.pth...", "level": "info"})
+    model = build_model().to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+    push({"type": "log", "text": "Checkpoint loaded.", "level": "success"})
+    push({"type": "file", "name": f"{model_name}.pth"})
 
-    push({"type": "log", "text": "All exports complete.", "level": "success"})
+    records   = None
+    data_root = None
+    if json_path:
+        try:
+            with open(json_path) as f:
+                records = json.load(f)
+            data_root = Path(json_path).parent
+            records = [r for r in records if (data_root / r["image_path"]).exists()]
+            push({"type": "log", "text": f"Loaded {len(records)} records for calibration.", "level": "info"})
+        except Exception as e:
+            push({"type": "log", "text": f"Could not load JSON: {e}", "level": "warning"})
+
+    _do_exports(model, model_name, formats, push, models_dir, device, records, data_root)
 
 
 # ── Standalone usage ──────────────────────────────────────────────────────────
