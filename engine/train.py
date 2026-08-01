@@ -4,6 +4,7 @@ RoboPacer training module — called by server.py or standalone.
 import json, os, random, subprocess, sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 import torch
@@ -13,12 +14,35 @@ import torchvision.transforms as T
 import torchvision.models as models
 
 IMG_SIZE      = 224
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 CALIB_N       = 200
 
 ENGINE_DIR = Path(__file__).parent
 ROOT_DIR   = ENGINE_DIR.parent
+
+
+# ── Preprocessing (must stay pixel-for-pixel identical to main.py on the Pi) ──
+
+def load_and_preprocess(path):
+    """cv2.resize INTER_LINEAR (no anti-aliasing) → /255 → normalize.
+    Matches main.py's preprocess() exactly so train and inference see the
+    same numbers."""
+    img = np.array(Image.open(path).convert("RGB"))
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    img = img.astype(np.float32) / 255.0
+    img = (img - IMAGENET_MEAN) / IMAGENET_STD
+    return torch.from_numpy(img.transpose(2, 0, 1))  # HWC → CHW
+
+
+def _pil_to_tensor(pil_img):
+    """Same ops as load_and_preprocess but starting from an already-open PIL
+    image (used after PIL-space augmentation in the training dataset)."""
+    arr = np.array(pil_img)
+    arr = cv2.resize(arr, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    arr = arr.astype(np.float32) / 255.0
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    return torch.from_numpy(arr.transpose(2, 0, 1))  # HWC → CHW
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -28,9 +52,6 @@ class SteeringDataset(Dataset):
         self.records = records
         self.root    = Path(root)
         self.augment = augment
-        self.resize  = T.Resize((IMG_SIZE, IMG_SIZE), antialias=True)
-        self.tt      = T.ToTensor()
-        self.norm    = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         self.jitter  = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2)
 
     def __len__(self):
@@ -40,14 +61,12 @@ class SteeringDataset(Dataset):
         rec   = self.records[idx]
         img   = Image.open(self.root / rec["image_path"]).convert("RGB")
         angle = float(rec["steering_angle"])
-        img   = self.resize(img)
         if self.augment:
             if random.random() < 0.5:
                 img   = T.functional.hflip(img)
                 angle = -angle
             img = self.jitter(img)
-        img = self.norm(self.tt(img))
-        return img, torch.tensor(angle, dtype=torch.float32)
+        return _pil_to_tensor(img), torch.tensor(angle, dtype=torch.float32)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -114,11 +133,8 @@ def _export_onnx(model, device, path):
 # ── Calibration data ──────────────────────────────────────────────────────────
 
 def _save_calib(records, data_root, out_path):
-    resize = T.Resize((IMG_SIZE, IMG_SIZE), antialias=True)
-    tt     = T.ToTensor()
-    norm   = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
     sample = random.sample(records, min(CALIB_N, len(records)))
-    arrays = [norm(tt(resize(Image.open(Path(data_root) / r["image_path"]).convert("RGB")))).numpy()
+    arrays = [load_and_preprocess(Path(data_root) / r["image_path"]).numpy()
               for r in sample]
     np.save(str(out_path), np.stack(arrays))
 
